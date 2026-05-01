@@ -191,13 +191,19 @@ async function notifyModerators(guild, content) {
 
 async function createDiscussionChannel(guild, applicant, sourceChannel) {
   const categoryId = process.env.APPLICATION_CATEGORY_ID || sourceChannel.parentId;
-  const applicantChannelName = `заявка-${applicant.user.username}`
+  const safeUsernamePart = applicant.user.username
     .toLowerCase()
-    .replace(/[^a-z0-9а-яё_-]/gi, "-")
-    .slice(0, 90);
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  const applicantChannelName = `application-${safeUsernamePart || applicant.id}`.slice(
+    0,
+    100
+  );
 
   const channel = await guild.channels.create({
-    name: applicantChannelName || `заявка-${applicant.id}`,
+    name: applicantChannelName,
     type: ChannelType.GuildText,
     parent: categoryId || null,
     topic: `Канал рассмотрения заявки от ${applicant.user.tag} (${applicant.id})`,
