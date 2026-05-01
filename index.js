@@ -1,8 +1,11 @@
 require("dotenv").config();
 const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
 
 const {
   ActionRowBuilder,
+  AttachmentBuilder,
   ButtonBuilder,
   ButtonStyle,
   ChannelType,
@@ -95,14 +98,26 @@ function buildApplicationPanel() {
       "Для того, чтобы подать заявку в **Unlowed FAMQ**, нажмите на кнопку ниже."
     );
 
+  const panelImageUrl = process.env.PANEL_IMAGE_URL;
+  const panelImagePath =
+    process.env.PANEL_IMAGE_PATH || path.join(process.cwd(), "assets", "panel-banner.png");
+  const files = [];
+  if (panelImageUrl) {
+    embed.setImage(panelImageUrl);
+  } else if (panelImagePath && fs.existsSync(panelImagePath)) {
+    const imageName = path.basename(panelImagePath);
+    files.push(new AttachmentBuilder(panelImagePath, { name: imageName }));
+    embed.setImage(`attachment://${imageName}`);
+  }
+
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(APPLICATION_BUTTON_ID)
-      .setLabel("Подать заявку")
-      .setStyle(ButtonStyle.Primary)
+      .setLabel("✨ Подать заявку")
+      .setStyle(ButtonStyle.Success)
   );
 
-  return { embeds: [embed], components: [row] };
+  return { embeds: [embed], components: [row], files };
 }
 
 function sleep(ms) {
