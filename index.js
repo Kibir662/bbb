@@ -237,13 +237,28 @@ async function createDiscussionChannel(guild, applicant, sourceChannel) {
     );
   }
 
-  const channel = await guild.channels.create({
-    name: applicantChannelName,
-    type: ChannelType.GuildText,
-    parent: category?.id || null,
-    topic: `Канал рассмотрения заявки от ${applicant.user.tag} (${applicant.id})`,
-    permissionOverwrites
-  });
+  let channel;
+  try {
+    channel = await guild.channels.create({
+      name: applicantChannelName,
+      type: ChannelType.GuildText,
+      parent: category?.id || null,
+      topic: `Канал рассмотрения заявки от ${applicant.user.tag} (${applicant.id})`,
+      permissionOverwrites
+    });
+  } catch (createError) {
+    console.error(
+      "Failed to create channel with overwrites/category. Retrying with minimal payload:",
+      createError
+    );
+    // Fallback: some servers deny overwrite/category operations due permission hierarchy.
+    // Try creating a plain text channel first, so the flow does not fully fail.
+    channel = await guild.channels.create({
+      name: applicantChannelName,
+      type: ChannelType.GuildText,
+      topic: `Канал рассмотрения заявки от ${applicant.user.tag} (${applicant.id})`
+    });
+  }
 
   await channel.send(
     `Канал заявки создан для ${applicant}. Пишите детали рассмотрения здесь.`
@@ -428,9 +443,16 @@ client.on("interactionCreate", async (interaction) => {
         );
       } catch (channelError) {
         console.error("Failed to create discussion channel:", channelError);
+        const discordErrorDetails = [
+          channelError?.code ? `code=${channelError.code}` : null,
+          channelError?.rawError?.message || channelError?.message || null
+        ]
+          .filter(Boolean)
+          .join(" | ");
         await interaction.editReply({
-          content:
-            "Заявка отправлена, но канал обсуждения не создан. Проверьте права бота (`Manage Channels`) и корректность MODERATOR_ROLE_ID/APPLICATION_CATEGORY_ID."
+          content: discordErrorDetails
+            ? `Заявка отправлена, но канал обсуждения не создан. ${discordErrorDetails}`
+            : "Заявка отправлена, но канал обсуждения не создан. Проверьте права бота (`Manage Channels`) и корректность MODERATOR_ROLE_ID/APPLICATION_CATEGORY_ID."
         });
         return;
       }
