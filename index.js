@@ -189,42 +189,132 @@ async function notifyModerators(guild, content) {
   }
 }
 
-async function createDiscussionChannel(guild, applicant, sourceChannel) {
-  const categoryId = process.env.APPLICATION_CATEGORY_ID || sourceChannel.parentId;
-  const applicantChannelName = `заявка-${applicant.user.username}`
-    .toLowerCase()
-    .replace(/[^a-z0-9а-яё_-]/gi, "-")
-    .slice(0, 90);
+function getBotPermissionDiagnostics(guild, contextChannel) {
+  const me = guild.members.me;
+  if (!me) {
+    return "Бот не видит свой Member-объект в guild (возможна проблема с кэшем/интентами).";
+  }
 
-  const channel = await guild.channels.create({
-    name: applicantChannelName || `заявка-${applicant.id}`,
-    type: ChannelType.GuildText,
-    parent: categoryId || null,
-    topic: `Канал рассмотрения заявки от ${applicant.user.tag} (${applicant.id})`,
-    permissionOverwrites: [
-      {
-        id: guild.roles.everyone.id,
-        deny: [PermissionFlagsBits.ViewChannel]
-      },
-      {
-        id: applicant.id,
-        allow: [
-          PermissionFlagsBits.ViewChannel,
-          PermissionFlagsBits.SendMessages,
-          PermissionFlagsBits.ReadMessageHistory
-        ]
-      },
-      {
-        id: process.env.MODERATOR_ROLE_ID,
-        allow: [
-          PermissionFlagsBits.ViewChannel,
-          PermissionFlagsBits.SendMessages,
-          PermissionFlagsBits.ReadMessageHistory,
-          PermissionFlagsBits.ManageMessages
-        ]
+  const missingGuildPerms = [];
+  if (!me.permissions.has(PermissionFlagsBits.ViewChannel)) {
+    missingGuildPerms.push("ViewChannel");
+  }
+  if (!me.permissions.has(PermissionFlagsBits.SendMessages)) {
+    missingGuildPerms.push("SendMessages");
+  }
+  if (!me.permissions.has(PermissionFlagsBits.ManageChannels)) {
+    missingGuildPerms.push("ManageChannels");
+  }
+
+  const missingChannelPerms = [];
+  if (contextChannel) {
+    const permsInChannel = contextChannel.permissionsFor(me);
+    if (permsInChannel) {
+      if (!permsInChannel.has(PermissionFlagsBits.ViewChannel)) {
+        missingChannelPerms.push("ViewChannel");
       }
-    ]
-  });
+      if (!permsInChannel.has(PermissionFlagsBits.SendMessages)) {
+        missingChannelPerms.push("SendMessages");
+      }
+    }
+  }
+
+  if (!missingGuildPerms.length && !missingChannelPerms.length) {
+    return "Права бота выглядят корректно.";
+  }
+
+  const parts = [];
+  if (missingGuildPerms.length) {
+    parts.push(`guild: ${missingGuildPerms.join(", ")}`);
+  }
+  if (missingChannelPerms.length) {
+    parts.push(`channel: ${missingChannelPerms.join(", ")}`);
+  }
+  return `Недостаточно прав у бота (${parts.join(" | ")}).`;
+}
+
+async function createDiscussionChannel(guild, applicant, sourceChannel) {
+  const requestedCategoryId = process.env.APPLICATION_CATEGORY_ID;
+  if (!requestedCategoryId) {
+    throw new Error("APPLICATION_CATEGORY_ID is not configured.");
+  }
+  const category =
+    guild.channels.cache.get(requestedCategoryId) ||
+    (await guild.channels.fetch(requestedCategoryId).catch(() => null));
+  if (!category) {
+    throw new Error(
+      `Category ${requestedCategoryId} not found in guild ${guild.id}.`
+    );
+  }
+  if (category.type !== ChannelType.GuildCategory) {
+    throw new Error(
+      `APPLICATION_CATEGORY_ID (${requestedCategoryId}) is not a category channel.`
+    );
+  }
+  const moderatorRole = guild.roles.cache.get(process.env.MODERATOR_ROLE_ID);
+  const safeUsernamePart = applicant.user.username
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  const applicantChannelName = `application-${safeUsernamePart || applicant.id}`.slice(
+    0,
+    100
+  );
+  const permissionOverwrites = [
+    {
+      id: guild.roles.everyone.id,
+      deny: [PermissionFlagsBits.ViewChannel]
+    },
+    {
+      id: applicant.id,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ReadMessageHistory
+      ]
+    }
+  ];
+  if (moderatorRole) {
+    permissionOverwrites.push({
+      id: moderatorRole.id,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ReadMessageHistory,
+        PermissionFlagsBits.ManageMessages
+      ]
+    });
+  } else {
+    console.warn(
+      "MODERATOR_ROLE_ID does not point to an existing role. Creating channel without moderator overwrite."
+    );
+  }
+
+  let channel;
+  try {
+    channel = await guild.channels.create({
+      name: applicantChannelName,
+      type: ChannelType.GuildText,
+      parent: category.id,
+      topic: `Канал рассмотрения заявки от ${applicant.user.tag} (${applicant.id})`,
+      permissionOverwrites
+    });
+  } catch (createError) {
+    console.error(
+      "Failed to create channel with overwrites/category. Retrying with minimal payload:",
+      createError
+    );
+    // Fallback: some servers deny overwrite/category operations due permission hierarchy.
+    // Try creating a plain text channel first, so the flow does not fully fail.
+    channel = await guild.channels.create({
+      name: applicantChannelName,
+      type: ChannelType.GuildText,
+      parent: category.id,
+      topic: `Канал рассмотрения заявки от ${applicant.user.tag} (${applicant.id})`
+    });
+  }
 
   await channel.send(
     `Канал заявки создан для ${applicant}. Пишите детали рассмотрения здесь.`
@@ -350,14 +440,15 @@ client.on("interactionCreate", async (interaction) => {
 
     if (interaction.isModalSubmit()) {
       if (interaction.customId !== APPLICATION_MODAL_ID) return;
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
       const targetChannel = await interaction.guild.channels.fetch(
         process.env.APPLICATION_CHANNEL_ID
       );
       if (!targetChannel || targetChannel.type !== ChannelType.GuildText) {
-        await interaction.reply({
-          content: "Канал для заявок не найден или не является текстовым.",
-          flags: MessageFlags.Ephemeral
+        await interaction.editReply({
+          content:
+            "Канал для заявок не найден или не является текстовым. Проверьте APPLICATION_CHANNEL_ID."
         });
         return;
       }
@@ -399,23 +490,47 @@ client.on("interactionCreate", async (interaction) => {
       const applicantMember = await interaction.guild.members.fetch(
         interaction.user.id
       );
-      const discussionChannel = await createDiscussionChannel(
-        interaction.guild,
-        applicantMember,
-        targetChannel
-      );
+      let discussionChannel;
+      try {
+        discussionChannel = await createDiscussionChannel(
+          interaction.guild,
+          applicantMember,
+          targetChannel
+        );
+      } catch (channelError) {
+        console.error("Failed to create discussion channel:", channelError);
+        const permissionHint = getBotPermissionDiagnostics(
+          interaction.guild,
+          targetChannel
+        );
+        const discordErrorDetails = [
+          channelError?.code ? `code=${channelError.code}` : null,
+          channelError?.rawError?.message || channelError?.message || null
+        ]
+          .filter(Boolean)
+          .join(" | ");
+        await interaction.editReply({
+          content: discordErrorDetails
+            ? `Заявка отправлена, но канал обсуждения не создан. ${discordErrorDetails}. ${permissionHint}`
+            : `Заявка отправлена, но канал обсуждения не создан. ${permissionHint}`
+        });
+        return;
+      }
       await targetChannel.send(
         `Создан канал рассмотрения: ${discussionChannel} для ${interaction.user}.`
       );
 
-      await notifyModerators(
-        interaction.guild,
-        `Обнаружена новая заявка Unlowed: ${msg.url}\nКанал рассмотрения: ${discussionChannel.url}`
-      );
+      try {
+        await notifyModerators(
+          interaction.guild,
+          `Обнаружена новая заявка Unlowed: ${msg.url}\nКанал рассмотрения: ${discussionChannel.url}`
+        );
+      } catch (notifyError) {
+        console.error("Failed to notify moderators:", notifyError);
+      }
 
-      await interaction.reply({
-        content: "Заявка отправлена. Ожидайте ответ модераторов.",
-        flags: MessageFlags.Ephemeral
+      await interaction.editReply({
+        content: "Заявка отправлена. Ожидайте ответ модераторов."
       });
     }
   } catch (error) {
