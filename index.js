@@ -190,75 +190,41 @@ async function notifyModerators(guild, content) {
 }
 
 async function createDiscussionChannel(guild, applicant, sourceChannel) {
-  const requestedCategoryId =
-    process.env.APPLICATION_CATEGORY_ID || sourceChannel.parentId;
-  const category = requestedCategoryId
-    ? guild.channels.cache.get(requestedCategoryId) ||
-      (await guild.channels.fetch(requestedCategoryId).catch(() => null))
-    : null;
-  const moderatorRole = guild.roles.cache.get(process.env.MODERATOR_ROLE_ID);
-  const safeUsernamePart = applicant.user.username
+  const categoryId = process.env.APPLICATION_CATEGORY_ID || sourceChannel.parentId;
+  const applicantChannelName = `заявка-${applicant.user.username}`
     .toLowerCase()
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-  const applicantChannelName = `application-${safeUsernamePart || applicant.id}`.slice(
-    0,
-    100
-  );
-  const permissionOverwrites = [
-    {
-      id: guild.roles.everyone.id,
-      deny: [PermissionFlagsBits.ViewChannel]
-    },
-    {
-      id: applicant.id,
-      allow: [
-        PermissionFlagsBits.ViewChannel,
-        PermissionFlagsBits.SendMessages,
-        PermissionFlagsBits.ReadMessageHistory
-      ]
-    }
-  ];
-  if (moderatorRole) {
-    permissionOverwrites.push({
-      id: moderatorRole.id,
-      allow: [
-        PermissionFlagsBits.ViewChannel,
-        PermissionFlagsBits.SendMessages,
-        PermissionFlagsBits.ReadMessageHistory,
-        PermissionFlagsBits.ManageMessages
-      ]
-    });
-  } else {
-    console.warn(
-      "MODERATOR_ROLE_ID does not point to an existing role. Creating channel without moderator overwrite."
-    );
-  }
+    .replace(/[^a-z0-9а-яё_-]/gi, "-")
+    .slice(0, 90);
 
-  let channel;
-  try {
-    channel = await guild.channels.create({
-      name: applicantChannelName,
-      type: ChannelType.GuildText,
-      parent: category?.id || null,
-      topic: `Канал рассмотрения заявки от ${applicant.user.tag} (${applicant.id})`,
-      permissionOverwrites
-    });
-  } catch (createError) {
-    console.error(
-      "Failed to create channel with overwrites/category. Retrying with minimal payload:",
-      createError
-    );
-    // Fallback: some servers deny overwrite/category operations due permission hierarchy.
-    // Try creating a plain text channel first, so the flow does not fully fail.
-    channel = await guild.channels.create({
-      name: applicantChannelName,
-      type: ChannelType.GuildText,
-      topic: `Канал рассмотрения заявки от ${applicant.user.tag} (${applicant.id})`
-    });
-  }
+  const channel = await guild.channels.create({
+    name: applicantChannelName || `заявка-${applicant.id}`,
+    type: ChannelType.GuildText,
+    parent: categoryId || null,
+    topic: `Канал рассмотрения заявки от ${applicant.user.tag} (${applicant.id})`,
+    permissionOverwrites: [
+      {
+        id: guild.roles.everyone.id,
+        deny: [PermissionFlagsBits.ViewChannel]
+      },
+      {
+        id: applicant.id,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.ReadMessageHistory
+        ]
+      },
+      {
+        id: process.env.MODERATOR_ROLE_ID,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.ReadMessageHistory,
+          PermissionFlagsBits.ManageMessages
+        ]
+      }
+    ]
+  });
 
   await channel.send(
     `Канал заявки создан для ${applicant}. Пишите детали рассмотрения здесь.`
@@ -384,15 +350,14 @@ client.on("interactionCreate", async (interaction) => {
 
     if (interaction.isModalSubmit()) {
       if (interaction.customId !== APPLICATION_MODAL_ID) return;
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
       const targetChannel = await interaction.guild.channels.fetch(
         process.env.APPLICATION_CHANNEL_ID
       );
       if (!targetChannel || targetChannel.type !== ChannelType.GuildText) {
-        await interaction.editReply({
-          content:
-            "Канал для заявок не найден или не является текстовым. Проверьте APPLICATION_CHANNEL_ID."
+        await interaction.reply({
+          content: "Канал для заявок не найден или не является текстовым.",
+          flags: MessageFlags.Ephemeral
         });
         return;
       }
@@ -434,43 +399,23 @@ client.on("interactionCreate", async (interaction) => {
       const applicantMember = await interaction.guild.members.fetch(
         interaction.user.id
       );
-      let discussionChannel;
-      try {
-        discussionChannel = await createDiscussionChannel(
-          interaction.guild,
-          applicantMember,
-          targetChannel
-        );
-      } catch (channelError) {
-        console.error("Failed to create discussion channel:", channelError);
-        const discordErrorDetails = [
-          channelError?.code ? `code=${channelError.code}` : null,
-          channelError?.rawError?.message || channelError?.message || null
-        ]
-          .filter(Boolean)
-          .join(" | ");
-        await interaction.editReply({
-          content: discordErrorDetails
-            ? `Заявка отправлена, но канал обсуждения не создан. ${discordErrorDetails}`
-            : "Заявка отправлена, но канал обсуждения не создан. Проверьте права бота (`Manage Channels`) и корректность MODERATOR_ROLE_ID/APPLICATION_CATEGORY_ID."
-        });
-        return;
-      }
+      const discussionChannel = await createDiscussionChannel(
+        interaction.guild,
+        applicantMember,
+        targetChannel
+      );
       await targetChannel.send(
         `Создан канал рассмотрения: ${discussionChannel} для ${interaction.user}.`
       );
 
-      try {
-        await notifyModerators(
-          interaction.guild,
-          `Обнаружена новая заявка Unlowed: ${msg.url}\nКанал рассмотрения: ${discussionChannel.url}`
-        );
-      } catch (notifyError) {
-        console.error("Failed to notify moderators:", notifyError);
-      }
+      await notifyModerators(
+        interaction.guild,
+        `Обнаружена новая заявка Unlowed: ${msg.url}\nКанал рассмотрения: ${discussionChannel.url}`
+      );
 
-      await interaction.editReply({
-        content: "Заявка отправлена. Ожидайте ответ модераторов."
+      await interaction.reply({
+        content: "Заявка отправлена. Ожидайте ответ модераторов.",
+        flags: MessageFlags.Ephemeral
       });
     }
   } catch (error) {
