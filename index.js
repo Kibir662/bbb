@@ -42,6 +42,13 @@ const NEWS_ALLOWED_ROLE_IDS = [
   "1486047078584160267",
   "1486047078558990578"
 ];
+const NEWS_MAX_RECIPIENTS = Number(process.env.NEWS_MAX_RECIPIENTS || 120);
+const NEWS_COOLDOWN_MS = Number(process.env.NEWS_COOLDOWN_MS || 10 * 60 * 1000);
+const NEWS_DELAY_MIN_MS = Number(process.env.NEWS_DELAY_MIN_MS || 1200);
+const NEWS_DELAY_MAX_MS = Number(process.env.NEWS_DELAY_MAX_MS || 2200);
+const NEWS_PROGRESS_EVERY = Number(process.env.NEWS_PROGRESS_EVERY || 10);
+let newsDispatchInProgress = false;
+let lastNewsDispatchAt = 0;
 
 const client = new Client({
   intents: [
@@ -96,6 +103,52 @@ function buildApplicationPanel() {
   );
 
   return { embeds: [embed], components: [row] };
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function randomBetween(min, max) {
+  if (max <= min) return min;
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function isRetryableDiscordError(error) {
+  const status = error?.status;
+  return status === 429 || (typeof status === "number" && status >= 500);
+}
+
+function buildNewsMessage(role, text) {
+  return `**Unlowed news для @${role.name}**\n${text}`;
+}
+
+async function sendNewsDmWithRetry(member, messageText) {
+  const maxAttempts = 4;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await member.send({ content: messageText, allowedMentions: { parse: [] } });
+      return { ok: true };
+    } catch (error) {
+      // Cannot DM this user (privacy settings or blocked bot).
+      if (error?.code === 50007) {
+        return { ok: false, permanent: true };
+      }
+
+      if (!isRetryableDiscordError(error) || attempt === maxAttempts) {
+        return { ok: false, permanent: false };
+      }
+
+      const retryAfterSeconds = Number(error?.rawError?.retry_after || 0);
+      const retryDelay =
+        retryAfterSeconds > 0
+          ? Math.ceil(retryAfterSeconds * 1000)
+          : 1200 * 2 ** (attempt - 1);
+      await sleep(retryDelay);
+    }
+  }
+
+  return { ok: false, permanent: false };
 }
 
 function buildModerationButtons() {
@@ -342,6 +395,7 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       if (interaction.commandName === "news") {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const senderMember = await interaction.guild.members.fetch(
           interaction.user.id
         );
@@ -349,40 +403,93 @@ client.on("interactionCreate", async (interaction) => {
           senderMember.roles.cache.has(roleId)
         );
         if (!canUseNews && !senderMember.permissions.has(PermissionFlagsBits.Administrator)) {
-          await interaction.reply({
-            content: "У вас нет прав для использования команды /news.",
-            flags: MessageFlags.Ephemeral
+          await interaction.editReply({
+            content: "У вас нет прав для использования команды /news."
+          });
+          return;
+        }
+
+        if (newsDispatchInProgress) {
+          await interaction.editReply({
+            content:
+              "Сейчас уже выполняется рассылка /news. Дождитесь её завершения."
+          });
+          return;
+        }
+
+        const cooldownLeft = NEWS_COOLDOWN_MS - (Date.now() - lastNewsDispatchAt);
+        if (cooldownLeft > 0) {
+          const waitMinutes = Math.ceil(cooldownLeft / 60000);
+          await interaction.editReply({
+            content: `Слишком частые рассылки. Подождите ${waitMinutes} мин.`
           });
           return;
         }
 
         const role = interaction.options.getRole("role", true);
         const text = interaction.options.getString("text", true);
+        await interaction.guild.members.fetch();
         const members = role.members.filter((member) => !member.user.bot);
 
         if (members.size === 0) {
-          await interaction.reply({
-            content: "У этой роли нет участников для рассылки.",
-            flags: MessageFlags.Ephemeral
+          await interaction.editReply({
+            content: "У этой роли нет участников для рассылки."
           });
           return;
         }
 
-        let success = 0;
-        let failed = 0;
-        for (const member of members.values()) {
-          try {
-            await member.send(`**Unlowed news**\n${text}`);
-            success += 1;
-          } catch (error) {
-            failed += 1;
-          }
+        if (members.size > NEWS_MAX_RECIPIENTS) {
+          await interaction.editReply({
+            content: `У роли слишком много участников (${members.size}). Лимит для безопасной рассылки: ${NEWS_MAX_RECIPIENTS}.`
+          });
+          return;
         }
 
-        await interaction.reply({
-          content: `Рассылка завершена. Успешно: ${success}, не доставлено: ${failed}.`,
-          flags: MessageFlags.Ephemeral
-        });
+        const preparedMessage = buildNewsMessage(role, text);
+        let success = 0;
+        let failed = 0;
+        let blockedDm = 0;
+
+        newsDispatchInProgress = true;
+        try {
+          const recipients = [...members.values()];
+          await interaction.editReply({
+            content: `Запускаю безопасную рассылку для роли @${role.name}. Получателей: ${recipients.length}.`
+          });
+
+          for (let i = 0; i < recipients.length; i += 1) {
+            const member = recipients[i];
+            const result = await sendNewsDmWithRetry(member, preparedMessage);
+            if (result.ok) {
+              success += 1;
+            } else {
+              failed += 1;
+              if (result.permanent) blockedDm += 1;
+            }
+
+            const isLast = i === recipients.length - 1;
+            if (!isLast) {
+              await sleep(randomBetween(NEWS_DELAY_MIN_MS, NEWS_DELAY_MAX_MS));
+            }
+
+            if ((i + 1) % NEWS_PROGRESS_EVERY === 0 || isLast) {
+              await interaction.editReply({
+                content:
+                  `Рассылка выполняется: ${i + 1}/${recipients.length}. ` +
+                  `Успешно: ${success}, ошибки: ${failed}.`
+              });
+            }
+          }
+
+          lastNewsDispatchAt = Date.now();
+          await interaction.editReply({
+            content:
+              `Рассылка завершена. Успешно: ${success}, не доставлено: ${failed}. ` +
+              `Недоступные ЛС: ${blockedDm}.`
+          });
+        } finally {
+          newsDispatchInProgress = false;
+        }
         return;
       }
     }
