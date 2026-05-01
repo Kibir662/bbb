@@ -258,7 +258,7 @@ async function createDiscussionChannel(guild, applicant, sourceChannel) {
     .replace(/[\u0300-\u036f]/g, "")
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
-  const applicantChannelName = `application-${safeUsernamePart || applicant.id}`.slice(
+  const applicantChannelName = `zayavka-${safeUsernamePart || applicant.id}`.slice(
     0,
     100
   );
